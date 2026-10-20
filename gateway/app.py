@@ -14,7 +14,10 @@ Each half is switched on by env, so one codebase runs everywhere:
 from __future__ import annotations
 
 import base64
+import functools
+import importlib.util
 import json
+import logging
 import os
 
 import httpx
@@ -39,8 +42,29 @@ def llm_enabled() -> bool:
     return os.environ.get("LLM_ENABLED", "1").strip() != "0"
 
 
-def speech_enabled() -> bool:
+log = logging.getLogger("gateway")
+
+
+def speech_requested() -> bool:
     return os.environ.get("SPEECH_ENABLED", "0").strip() == "1"
+
+
+@functools.lru_cache(maxsize=4)
+def _speech_libs_present(stub: bool) -> bool:
+    """numpy always; faster_whisper too unless the model is stubbed (tests)."""
+    needed = ("numpy",) if stub else ("numpy", "faster_whisper")
+    return all(importlib.util.find_spec(name) is not None for name in needed)
+
+
+def speech_libs_present() -> bool:
+    return _speech_libs_present(os.environ.get("TARA_STUB") == "1")
+
+
+def speech_enabled() -> bool:
+    """Speech runs only when asked for AND its libraries are installed. The LLM-only
+    image has no speech libraries, so a stray SPEECH_ENABLED=1 there turns speech off
+    instead of crashing the whole gateway."""
+    return speech_requested() and speech_libs_present()
 
 FORMAT_SYSTEM = """You clean dictated speech into the text the speaker meant to send.
 
@@ -195,6 +219,8 @@ def health():
     if speech_enabled():
         ready = _model is not None or os.environ.get("TARA_STUB") == "1"
         body["speech"] = {"status": "ok" if ready else "loading", "model": MODEL_DIR, **speech_gate.snapshot()}
+    elif speech_requested():
+        body["speech"] = "off: SPEECH_ENABLED=1 but the speech libraries are not installed"
     else:
         body["speech"] = "off"
     return body, status
@@ -414,6 +440,12 @@ def transcribe_route():
         return _json_error("audio_base64 is required", 400)
     return speech_dispatch(lambda: transcribe(data))
 
+
+if speech_requested() and not speech_libs_present():
+    log.warning(
+        "SPEECH_ENABLED=1 but numpy/faster_whisper are not installed; speech is off. "
+        "Set SPEECH_ENABLED=0 on LLM-only machines."
+    )
 
 if speech_enabled() and os.environ.get("TARA_EAGER", "1") == "1" and os.environ.get("TARA_STUB") != "1":
     # Load and warm the model at start so the first dictation is not slow.

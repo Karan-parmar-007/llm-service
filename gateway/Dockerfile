@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 FROM python:3.12-slim
 
-LABEL org.opencontainers.image.source=https://github.com/Karan-parmar-007/studio-services
+LABEL org.opencontainers.image.source=https://github.com/Karan-parmar-007/llm-service
 LABEL org.opencontainers.image.description="Studio gateway: LLM in front of Ollama"
 
 WORKDIR /app

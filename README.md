@@ -23,7 +23,7 @@ Keep `FLOW_TOKEN` identical here and in `studio-backend`.
 
 ## LLM VPS (Docker, arm64)
 
-The LLM half ships as an image, `ghcr.io/karan-parmar-007/studio-services`, built for
+The LLM half ships as an image, `ghcr.io/karan-parmar-007/llm-service`, built for
 arm64 by CI. On the server it runs from `/srv/docker/apps/studio-gateway/` using the
 compose file and `.env.example` in `new_deployment/studio-gateway`. The container uses
 host networking, so it reaches Ollama on `127.0.0.1:11434` and its port 8011 stays

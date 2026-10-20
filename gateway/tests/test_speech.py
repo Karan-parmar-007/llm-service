@@ -122,3 +122,36 @@ def test_health_reports_each_half(client, monkeypatch):
     body = client.get("/health").get_json()
     assert body["llm"] == "off"
     assert body["speech"]["status"] == "ok"
+
+
+def test_speech_turns_itself_off_when_libraries_are_missing(client, monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "numpy", None)  # as in the LLM-only image
+    speech._speech_libs_present.cache_clear()
+    try:
+        assert speech.speech_enabled() is False
+        assert client.post("/transcribe", json={"audio_base64": "UklGRg=="}).status_code == 404
+        assert "not installed" in client.get("/health").get_json()["speech"]
+    finally:
+        speech._speech_libs_present.cache_clear()
+
+
+def test_llm_image_with_speech_switched_on_still_boots(tmp_path):
+    """Reproduces the CI crash: SPEECH_ENABLED=1 in an image without numpy."""
+    import os
+    import subprocess
+    import sys
+
+    here = os.path.dirname(os.path.dirname(__file__))
+    code = (
+        "import sys; sys.modules['numpy'] = None; sys.modules['faster_whisper'] = None; "
+        "sys.path.insert(0, %r); import app; "
+        "print(app.app.test_client().post('/format', json={}).status_code)"
+    ) % here
+    env = dict(os.environ, SPEECH_ENABLED="1", TARA_EAGER="1", FLOW_TOKEN="")
+    env.pop("TARA_STUB", None)
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "400"  # app imported and serves the LLM ("Text is required")
+    assert "speech is off" in result.stderr
