@@ -1,0 +1,5 @@
+# Only on a machine that runs speech (SPEECH_ENABLED=1, needs an NVIDIA GPU).
+-r requirements.txt
+numpy>=1.26
+av>=13.0
+faster-whisper>=1.1

@@ -1,0 +1,165 @@
+# Test on every push/PR. On master: build an arm64 image (the LLM VPS is Oracle
+# Ampere), publish it public on GHCR, pull it on the LLM VPS, swap the studio-gateway
+# container only, then prune the old image and old GHCR versions.
+#
+# The container runs with host networking: it reaches Ollama on 127.0.0.1:11434 and
+# its port 8011 stays under ufw (ports published through Docker would bypass ufw).
+#
+# Secrets: LLM_HOST, LLM_USER, LLM_SSH_KEY
+
+name: Build and deploy
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: studio-gateway-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  SERVICE: studio-gateway
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: gateway
+        run: pip install -r requirements-dev.txt   # speech model is stubbed in tests
+
+      - name: Test gateway
+        working-directory: gateway
+        run: python -m pytest -q tests
+
+  build-and-deploy:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      actions: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long,prefix=
+
+      - name: Set up QEMU (arm64 builds on an x86 runner)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: gateway
+          file: gateway/Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Make GHCR package public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pkg="${IMAGE_NAME#*/}"
+          gh api --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "/user/packages/container/${pkg}/visibility" \
+            -f visibility=public \
+            || echo "If this fails, set the package public once in GitHub: Packages → $pkg → Package settings → Change visibility → Public"
+
+      - name: Deploy on the LLM VPS
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          IMAGE_TAG: ${{ github.sha }}
+          SERVICE: ${{ env.SERVICE }}
+        with:
+          host: ${{ secrets.LLM_HOST }}
+          username: ${{ secrets.LLM_USER }}
+          key: ${{ secrets.LLM_SSH_KEY }}
+          envs: GHCR_TOKEN,GHCR_USER,IMAGE,IMAGE_TAG,SERVICE
+          command_timeout: 15m
+          script: |
+            set -euo pipefail
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            cd /srv/docker/apps/studio-gateway
+            export STUDIO_GATEWAY_IMAGE="$IMAGE"
+            export STUDIO_GATEWAY_TAG="$IMAGE_TAG"
+
+            docker compose pull "$SERVICE"
+
+            OLD_IMAGE_ID="$(docker inspect -f '{{.Image}}' "$SERVICE" 2>/dev/null || true)"
+
+            if ! docker compose up -d --no-deps --pull never --wait --wait-timeout 120 --force-recreate "$SERVICE"; then
+              echo "---- $SERVICE logs ----"
+              docker compose logs --tail=120 "$SERVICE" || true
+              docker inspect --format='{{json .State.Health}}' "$SERVICE" || true
+              exit 1
+            fi
+
+            NEW_IMAGE_ID="$(docker inspect -f '{{.Image}}' "$SERVICE")"
+            if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$NEW_IMAGE_ID" ]; then
+              docker rmi "$OLD_IMAGE_ID" || true
+            fi
+            docker image prune -f
+
+      - name: Delete untagged GHCR versions
+        uses: actions/delete-package-versions@v5
+        continue-on-error: true
+        with:
+          package-name: llm-service
+          package-type: container
+          min-versions-to-keep: 0
+          delete-only-untagged-versions: true
+
+      - name: Keep last 3 tagged GHCR versions
+        uses: actions/delete-package-versions@v5
+        continue-on-error: true
+        with:
+          package-name: llm-service
+          package-type: container
+          min-versions-to-keep: 3
