@@ -23,6 +23,7 @@ import os
 import httpx
 from flask import Flask, Response, request, stream_with_context
 
+from keepalive import KeepAlive, ollama_burn
 from lanes import Gate, QueueFull, gate
 from points import shape_points
 from roman import romanize
@@ -99,6 +100,8 @@ def only_enabled_parts():
     path = request.path
     if path.startswith(_LLM_PATHS) and not llm_enabled():
         return {"detail": "This gateway does not serve the LLM."}, 404
+    if keeper is not None and request.method != "GET" and path.startswith(_LLM_PATHS):
+        keeper.user_activity()  # user first: cancel any keep-alive generation now
     if path == "/transcribe" and not speech_enabled():
         return {"detail": "This gateway does not serve speech."}, 404
     return None
@@ -199,6 +202,30 @@ def job_view(job, owner: Gate | None = None) -> tuple[dict, int]:
     }, 200
 
 
+def _llm_busy() -> bool:
+    board = gate.snapshot()
+    return board["running"] > 0 or any(lane["queued"] for lane in board["lanes"].values())
+
+
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        return max(1.0, float(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+keeper: KeepAlive | None = None
+if llm_enabled() and os.environ.get("KEEPALIVE_ENABLED", "0").strip() == "1":
+    keeper = KeepAlive(
+        _llm_busy,
+        ollama_burn(OLLAMA, DEFAULT_MODEL),
+        busy_seconds=_env_seconds("KEEPALIVE_BUSY_SECONDS", 20),
+        idle_seconds=_env_seconds("KEEPALIVE_IDLE_SECONDS", 40),
+        quiet_seconds=_env_seconds("KEEPALIVE_QUIET_SECONDS", 30),
+    )
+    keeper.start()
+
+
 @app.get("/health")
 def health():
     body: dict = {"status": "ok"}
@@ -223,6 +250,7 @@ def health():
         body["speech"] = "off: SPEECH_ENABLED=1 but the speech libraries are not installed"
     else:
         body["speech"] = "off"
+    body["keepalive"] = keeper.snapshot() if keeper is not None else "off"
     return body, status
 
 

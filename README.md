@@ -29,6 +29,15 @@ compose file and `.env.example` in `new_deployment/studio-gateway`. The containe
 host networking, so it reaches Ollama on `127.0.0.1:11434` and its port 8011 stays
 under ufw (`sudo ufw allow from <web-vps-ip> to any port 8011 proto tcp`).
 
+## Keep-alive (LLM VPS)
+
+With `KEEPALIVE_ENABLED=1` the gateway keeps Ollama generating in a duty cycle while
+nobody uses it, so Oracle never sees the instance as idle. Every user LLM request
+cancels the running keep-alive generation immediately (the stream is closed and
+Ollama stops at the next token), and keep-alive waits `KEEPALIVE_QUIET_SECONDS` after
+the last user request before starting again. Its state is in `/health` under
+`keepalive`. This replaces any separate keep-alive script on the server.
+
 ## PC
 
 ```bash
