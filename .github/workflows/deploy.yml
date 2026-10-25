@@ -132,7 +132,6 @@ jobs:
 
             docker compose pull "$SERVICE"
 
-            OLD_IMAGE_ID="$(docker inspect -f '{{.Image}}' "$SERVICE" 2>/dev/null || true)"
 
             if ! docker compose up -d --no-deps --pull never --wait --wait-timeout 120 --force-recreate "$SERVICE"; then
               echo "---- $SERVICE logs ----"
@@ -142,10 +141,19 @@ jobs:
             fi
 
             NEW_IMAGE_ID="$(docker inspect -f '{{.Image}}' "$SERVICE")"
-            if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$NEW_IMAGE_ID" ]; then
-              docker rmi "$OLD_IMAGE_ID" || true
-            fi
+            # Remove every other local version of this app's image (any tag), then
+            # dangling layers and build cache. Scoped to this image so a parallel
+            # deploy of another app never loses the image it just pulled.
+            docker images --no-trunc --format '{{.ID}} {{.Repository}}:{{.Tag}}' "$IMAGE" \
+              | while read -r id ref; do
+                  [ "$id" = "$NEW_IMAGE_ID" ] && continue
+                  case "$ref" in
+                    *:"<none>") docker rmi "$id" || true ;;
+                    *) docker rmi "$ref" || true ;;
+                  esac
+                done
             docker image prune -f
+            docker builder prune -af > /dev/null || true
 
       - name: Delete untagged GHCR versions
         uses: actions/delete-package-versions@v5
