@@ -122,9 +122,18 @@ jobs:
           username: ${{ secrets.LLM_USER }}
           key: ${{ secrets.LLM_SSH_KEY }}
           envs: GHCR_TOKEN,GHCR_USER,IMAGE,IMAGE_TAG,SERVICE
-          command_timeout: 15m
+          command_timeout: 30m
           script: |
             set -euo pipefail
+            # One deploy at a time on this server: parallel pulls and image
+            # cleanup from different repos race inside containerd.
+            exec 9>/tmp/karanparmar-deploy.lock
+            echo "Waiting for other deploys on this server..."
+            flock -w 1200 9
+            # Private registry login for this job only. A shared ~/.docker/config.json
+            # gets overwritten by parallel jobs whose tokens expire mid-pull ("denied").
+            export DOCKER_CONFIG="$(mktemp -d)"
+            trap 'rm -rf "$DOCKER_CONFIG"' EXIT
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             cd /srv/docker/apps/studio-gateway
             export STUDIO_GATEWAY_IMAGE="$IMAGE"
