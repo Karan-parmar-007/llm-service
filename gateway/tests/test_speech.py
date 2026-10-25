@@ -1,6 +1,7 @@
 import base64
 import io
 import threading
+import time
 import wave
 
 import pytest
@@ -78,12 +79,25 @@ def test_token_is_required_when_set(client, monkeypatch):
         json={"audio_base64": base64.b64encode(wav_bytes()).decode()},
     )
     assert response.status_code == 401
+
+    # Slow the stub down so the answer is always a job to poll, on any machine.
+    real_transcribe = speech.transcribe
+
+    def slow_transcribe(data):
+        time.sleep(0.2)
+        return real_transcribe(data)
+
+    monkeypatch.setattr(speech, "transcribe", slow_transcribe)
+    token = {"X-Flow-Token": "secret-token"}
     allowed = client.post(
         "/transcribe",
         json={"audio_base64": base64.b64encode(wav_bytes()).decode()},
-        headers={"X-Flow-Token": "secret-token"},
+        headers=token,
     )
-    assert finished_body(client, allowed)["text"].startswith("point 1")
+    assert allowed.status_code == 202
+    job_id = allowed.get_json()["id"]
+    assert client.get(f"/jobs/{job_id}").status_code == 401
+    assert finished_body(client, allowed, headers=token)["text"].startswith("point 1")
 
 
 def test_speech_is_off_unless_enabled(client, monkeypatch):

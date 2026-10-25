@@ -12,8 +12,12 @@ os.environ["KEEPALIVE_ENABLED"] = "0"
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 
-def finished_body(client, response, timeout: float = 5):
-    """The model call either finished on this response or left a job to poll."""
+def finished_body(client, response, timeout: float = 5, headers: dict | None = None):
+    """The model call either finished on this response or left a job to poll.
+
+    Pass the same headers as the original call (e.g. X-Flow-Token): polls are
+    authenticated too.
+    """
     body = response.get_json()
     if response.status_code == 200 and isinstance(body, dict) and "text" in body:
         return body
@@ -21,7 +25,7 @@ def finished_body(client, response, timeout: float = 5):
     deadline = time.time() + timeout
     last = body
     while time.time() < deadline:
-        last = client.get(f"/jobs/{body['id']}").get_json()
+        last = client.get(f"/jobs/{body['id']}", headers=headers).get_json()
         if last.get("status") == "done":
             result = last.get("result") or {}
             assert isinstance(result, dict) and "text" in result
