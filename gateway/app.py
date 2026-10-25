@@ -1,8 +1,9 @@
 """Studio gateway: one Flask service for every model Studio calls.
 
 LLM (Ollama): /format, /chat, and a pass-through of /v1/* and /api/* for RAG.
-Three lanes run at once (voice, chat, rag); a second request on a busy lane is
-queued and the caller gets a job id to poll.
+Three lanes run at once (voice, chat, rag). Format, chat, and transcribe answer
+immediately with a job id and finish in the background, so a slow model does not
+hold the HTTP connection open. A second request on a busy lane waits behind the first.
 
 Speech (Tara, faster-whisper on CUDA): /transcribe, one at a time, queued the same way.
 
@@ -19,6 +20,7 @@ import importlib.util
 import json
 import logging
 import os
+import threading
 
 import httpx
 from flask import Flask, Response, request, stream_with_context
@@ -77,6 +79,7 @@ Rules:
 - Apply self-corrections. "5 pm, actually 6" becomes "6 pm".
 - When they number points ("point 1", "point 2", "pehla", "doosra"), output a numbered list and nothing else.
 - Do not add facts, greetings, labels, or quotes around the result.
+- Never write the words script= or tone=.
 - Reply with the final text only.
 """
 
@@ -157,6 +160,21 @@ def call_upstream(method: str, url: str, body: dict | None):
     return payload
 
 
+def _answer(job, owner: Gate | None = None):
+    """Hand back a finished result, or a job id the caller can poll.
+
+    The GPU often needs longer than a quiet reverse tunnel will stay open. The
+    HTTP call returns immediately and the model keeps running on this machine.
+    """
+    if job.status == "running":
+        threading.Thread(target=(owner or gate)._run, args=(job,), daemon=True).start()
+    if job.status == "done":
+        return job.result
+    if job.status == "error":
+        return _json_error(job.error or "The request failed.", 503)
+    return job_view(job, owner)
+
+
 def dispatch(lane: str, fn):
     try:
         job = gate.admit(lane, fn)
@@ -166,12 +184,7 @@ def dispatch(lane: str, fn):
             "lane": exc.lane,
             "lanes": gate.snapshot(),
         }, 429
-    if job.status == "queued":
-        return queued_body(job), 202
-    try:
-        return gate.run_inline(job)
-    except RuntimeError as exc:
-        return _json_error(str(exc), 503)
+    return _answer(job)
 
 
 def job_view(job, owner: Gate | None = None) -> tuple[dict, int]:
@@ -347,17 +360,21 @@ def format_text():
     if not text:
         return _json_error("Text is required", 400)
     script = "devanagari" if str(body.get("script") or "").lower() == "devanagari" else "roman"
-    tone = str(body.get("tone") or "plain").strip() or "plain"
     model = str(body.get("model") or DEFAULT_MODEL)
     source = romanize(text) if script == "roman" else text
+    script_rule = (
+        "Write Hindi in Devanagari and English in Latin letters."
+        if script == "devanagari"
+        else "Write Hindi in Latin letters."
+    )
     payload = {
         "model": model,
         "temperature": 0.2,
         "max_tokens": 800,
         "stream": False,
         "messages": [
-            {"role": "system", "content": FORMAT_SYSTEM},
-            {"role": "user", "content": f"script={script}\ntone={tone}\n\n{source}"},
+            {"role": "system", "content": FORMAT_SYSTEM + "\n- " + script_rule},
+            {"role": "user", "content": source},
         ],
     }
 
@@ -367,6 +384,10 @@ def format_text():
             content = raw["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError, TypeError):
             raise RuntimeError("Ollama returned an unexpected body") from None
+        lines = content.splitlines()
+        while lines and lines[0].strip().lower().startswith(("script=", "tone=")):
+            lines.pop(0)
+        content = "\n".join(lines).strip()
         if script == "roman":
             content = romanize(content)
         content = shape_points(content)
@@ -436,8 +457,6 @@ def transcribe(data: bytes) -> dict:
 
 
 def speech_dispatch(fn):
-    from audio import BadAudio
-
     try:
         job = speech_gate.admit("speech", fn)
     except QueueFull:
@@ -446,14 +465,7 @@ def speech_dispatch(fn):
             "lane": "speech",
             "lanes": speech_gate.snapshot(),
         }, 429
-    if job.status == "queued":
-        return queued_body(job, speech_gate), 202
-    try:
-        return speech_gate.run_inline(job)
-    except BadAudio as exc:
-        return _json_error(str(exc), 400)
-    except RuntimeError as exc:
-        return _json_error(str(exc), 503)
+    return _answer(job, speech_gate)
 
 
 @app.post("/transcribe")

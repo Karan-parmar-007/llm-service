@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 import app as gateway
+from conftest import finished_body
 from lanes import Gate
 
 
@@ -50,12 +51,13 @@ def test_format_sends_the_dictation_task(client, monkeypatch):
         "/format",
         json={"text": "point 1 home. point 2 keyboard.", "script": "roman", "tone": "whatsapp"},
     )
-    assert response.status_code == 200
-    assert response.get_json()["text"].startswith("1. Home")
+    assert finished_body(client, response)["text"].startswith("1. Home")
     assert captured["path"] == "/v1/chat/completions"
     assert captured["json"]["model"] == "qwen2.5:7b-instruct-q5_K_M"
     assert "point 1" in captured["json"]["messages"][1]["content"]
-    assert "script=roman" in captured["json"]["messages"][1]["content"]
+    assert "script=" not in captured["json"]["messages"][1]["content"]
+    assert "tone=" not in captured["json"]["messages"][1]["content"]
+    assert "Latin letters" in captured["json"]["messages"][0]["content"]
 
 
 def test_format_rejects_empty_text(client):
@@ -181,6 +183,42 @@ def test_a_second_voice_request_is_queued(client, monkeypatch):
     assert body["lane"] == "voice"
     assert body["position"] == 1
     release.set()
+
+
+def test_format_answers_before_a_slow_model_finishes(client, monkeypatch):
+    release = threading.Event()
+
+    class BlockingClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def request(self, method, url, json):
+            release.wait(2)
+
+            class Done:
+                status_code = 200
+                headers = {"content-type": "application/json"}
+
+                def json(self):
+                    return {"choices": [{"message": {"content": "shaped line"}}]}
+
+            return Done()
+
+    monkeypatch.setattr(gateway.httpx, "Client", BlockingClient)
+    response = client.post("/format", json={"text": "hello there friend"})
+    assert response.status_code == 202
+    assert response.get_json()["status"] == "running"
+    early = client.get(f"/jobs/{response.get_json()['id']}")
+    assert early.status_code == 202
+    assert early.get_json()["status"] == "running"
+    release.set()
+    assert finished_body(client, response)["text"] == "shaped line"
 
 
 def test_ollama_down_is_503(client, monkeypatch):

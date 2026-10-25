@@ -6,6 +6,7 @@ import wave
 import pytest
 
 import app as speech
+from conftest import finished_body
 from lanes import Gate
 
 
@@ -30,8 +31,7 @@ def client(monkeypatch):
 def test_a_wav_clip_is_transcribed(client):
     payload = {"audio_base64": base64.b64encode(wav_bytes()).decode()}
     response = client.post("/transcribe", json=payload)
-    assert response.status_code == 200
-    assert response.get_json()["text"].startswith("point 1")
+    assert finished_body(client, response)["text"].startswith("point 1")
 
 
 def test_empty_audio_is_refused(client):
@@ -83,7 +83,7 @@ def test_token_is_required_when_set(client, monkeypatch):
         json={"audio_base64": base64.b64encode(wav_bytes()).decode()},
         headers={"X-Flow-Token": "secret-token"},
     )
-    assert allowed.status_code == 200
+    assert finished_body(client, allowed)["text"].startswith("point 1")
 
 
 def test_speech_is_off_unless_enabled(client, monkeypatch):
