@@ -76,7 +76,17 @@ Rules:
 - script=roman: write Hindi in Latin letters. "kal milte hain" is right. "कल मिलते हैं" is wrong. "see you tomorrow" is wrong because that is a translation.
 - script=devanagari: write Hindi in Devanagari and English in Latin letters.
 - Drop fillers only when they add nothing. Keep "matlab" and "toh" when they change the meaning.
-- Apply self-corrections. "5 pm, actually 6" becomes "6 pm".
+- Self-corrections: when the speaker changes their mind, keep only their final choice. Delete the earlier version and the correction words. Correction words include: actually, I mean, sorry, no, wait no, scratch that, make that, or let it be, let it be, nahi, nahi nahi, rehne do, ek minute, matlab nahi.
+  "call at 5 pm, actually 6" becomes "Call at 6 pm."
+  "let's connect at 6 or 7, or let it be, let's connect at 8" becomes "Let's connect at 8."
+  "send it to Rahul, I mean send it to Priya" becomes "Send it to Priya."
+  "kal 4 baje, nahi nahi 5 baje" becomes "kal 5 baje"
+  "mujhe chai chahiye, rehne do, coffee chahiye" becomes "mujhe coffee chahiye"
+  "main Pune ja raha hoon, ek minute, main Mumbai ja raha hoon" becomes "main Mumbai ja raha hoon"
+- It is only a correction when a later part replaces an earlier one. Keep everything when the speaker offers choices or uses these words normally:
+  "let's meet at 6 or 7, whichever works" stays with both times.
+  "I mean it, this is important" becomes "I mean it, this is important." Here "I mean it" is emphasis, not a filler and not a correction, so never drop it.
+  "wait for me at the gate" and "sorry for the delay" stay as they are.
 - When they number points ("point 1", "point 2", "pehla", "doosra"), output a numbered list and nothing else.
 - Do not add facts, greetings, labels, or quotes around the result.
 - Never write the words script= or tone=.
