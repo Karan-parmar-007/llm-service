@@ -13,7 +13,7 @@ from lanes import Gate
 
 @pytest.fixture
 def client(monkeypatch):
-    monkeypatch.setattr(gateway, "DEFAULT_MODEL", "qwen2.5:7b-instruct-q5_K_M")
+    monkeypatch.setattr(gateway, "DEFAULT_MODEL", "qwen3.5:4b-q4_K_M")
     monkeypatch.setattr(gateway, "gate", Gate())
     return gateway.app.test_client()
 
@@ -53,7 +53,8 @@ def test_format_sends_the_dictation_task(client, monkeypatch):
     )
     assert finished_body(client, response)["text"].startswith("1. Home")
     assert captured["path"] == "/v1/chat/completions"
-    assert captured["json"]["model"] == "qwen2.5:7b-instruct-q5_K_M"
+    assert captured["json"]["model"] == "qwen3.5:4b-q4_K_M"
+    assert captured["json"]["think"] is False
     assert "point 1" in captured["json"]["messages"][1]["content"]
     assert "script=" not in captured["json"]["messages"][1]["content"]
     assert "tone=" not in captured["json"]["messages"][1]["content"]
@@ -103,6 +104,7 @@ def test_chat_completions_are_forwarded_with_the_callers_model(client, monkeypat
     assert response.status_code == 200
     assert captured["url"] == "/v1/chat/completions"
     assert captured["json"]["model"] == "some-other-model"
+    assert captured["json"]["think"] is False
     assert json.loads(response.data)["id"] == "ok"
 
 
@@ -136,7 +138,7 @@ def test_embeddings_path_is_forwarded(client, monkeypatch):
     response = client.post("/v1/embeddings", json={"input": "kara"})
     assert response.status_code == 200
     assert captured["url"] == "/v1/embeddings"
-    assert captured["json"]["model"] == "qwen2.5:7b-instruct-q5_K_M"
+    assert captured["json"]["model"] == "qwen3.5:4b-q4_K_M"
     assert captured["json"]["input"] == "kara"
 
 
@@ -236,5 +238,56 @@ def test_ollama_down_is_503(client, monkeypatch):
             raise httpx.ConnectError("refused")
 
     monkeypatch.setattr(gateway.httpx, "Client", FakeClient)
-    response = client.post("/api/chat", json={"model": "qwen2.5:7b-instruct-q5_K_M"})
+    response = client.post("/api/chat", json={"model": "qwen3.5:4b-q4_K_M"})
     assert response.status_code == 503
+
+
+def _fake_ollama(monkeypatch, captured: dict, reply: str):
+    class FakeResponse:
+        status_code = 200
+        content = b""
+
+        def json(self):
+            return {"choices": [{"message": {"content": reply}}]}
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def request(self, method, url, json):
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(gateway.httpx, "Client", FakeClient)
+
+
+def test_thinking_is_switched_off_for_format_and_chat(client, monkeypatch):
+    """qwen3.x spends the whole token budget thinking unless /v1 gets reasoning_effort=none."""
+    captured: dict = {}
+    _fake_ollama(monkeypatch, captured, "ok")
+    finished_body(client, client.post("/format", json={"text": "hello", "script": "roman"}))
+    assert captured["json"]["reasoning_effort"] == "none"
+    finished_body(client, client.post("/chat", json={"text": "hello"}))
+    assert captured["json"]["reasoning_effort"] == "none"
+
+
+def test_hinglish_reaches_the_model_as_spoken_and_leaves_in_latin(client, monkeypatch):
+    """The model gets the original Devanagari (rule-based romanizing mangles ऑफिस into 'phis');
+    any Devanagari left in its answer is still converted, so script=roman never shows Devanagari."""
+    captured: dict = {}
+    _fake_ollama(monkeypatch, captured, "Main kal office nahi aaunga, मेरी तबीयत ठीक नहीं है")
+    body = finished_body(
+        client, client.post("/format", json={"text": "मैं कल ऑफिस नहीं आऊंगा, मेरी तबीयत ठीक नहीं है", "script": "roman"})
+    )
+    assert "ऑफिस" in captured["json"]["messages"][1]["content"]
+    assert not any("ऀ" <= ch <= "ॿ" for ch in body["text"])
+    assert body["text"].startswith("Main kal office nahi aaunga")

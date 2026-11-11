@@ -41,6 +41,7 @@ def ollama_burn(base: str, model: str) -> Burn:
             "model": model,
             "prompt": PROMPT,
             "stream": True,
+            "think": False,
             "keep_alive": -1,
             "options": {"num_predict": 4096},
         }
