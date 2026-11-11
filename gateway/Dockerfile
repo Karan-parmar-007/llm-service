@@ -30,9 +30,15 @@ RUN useradd --create-home --uid 1000 appuser
 COPY --from=builder /opt/venv /opt/venv
 COPY --chown=appuser:appuser *.py ./
 
+# Cross-encoder reranker (int8 ONNX, ~150 MB) baked into the image so /rerank works offline.
+ENV RERANK_MODEL_DIR=/opt/reranker
+RUN python fetch_reranker.py /opt/reranker && chown -R appuser:appuser /opt/reranker
+
 USER appuser
 
 EXPOSE 8011
 
 # One worker on purpose: the lanes and queued jobs live in this process's memory.
-CMD ["sh", "-c", "exec gunicorn -w 1 --threads 8 --timeout 300 -b \"$BIND\" app:app"]
+# Threads, not processes: a caller waiting in line (X-Wait) holds one thread, so there
+# must be room for every lane's waiting line (5 lanes x LANE_MAX_WAITING) plus streams.
+CMD ["sh", "-c", "exec gunicorn -w 1 --threads ${GUNICORN_THREADS:-64} --timeout 330 -b \"$BIND\" app:app"]

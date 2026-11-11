@@ -2,3 +2,7 @@
 flask==3.1.2
 gunicorn==23.0.0
 httpx==0.28.1
+# Reranker (/rerank): ONNX Runtime + tokenizers on CPU, no torch.
+numpy>=1.26
+onnxruntime>=1.20
+tokenizers>=0.21

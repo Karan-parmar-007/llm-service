@@ -60,3 +60,21 @@ Push to `master`: tests run, CI builds the arm64 image and pushes it to GHCR, th
 LLM VPS it pulls the image, recreates only the `studio-gateway` container (waiting for
 its health check), removes the old image, and trims old GHCR versions. Secrets:
 `LLM_HOST`, `LLM_USER`, `LLM_SSH_KEY`.
+
+## Lanes, waiting in line, and the reranker (chatbot + Ask a Document)
+
+Five lanes, one running request each, 20 waiting per lane (`LANE_MAX_WAITING`):
+`voice`, `chat`, `rag` answer people; `embed` carries embeddings and `/rerank` so they never
+wait behind a 60-second answer; `ingest` carries bulk document work and starts only when no
+person is waiting (`INGEST_YIELD_SECONDS`). `/api/embed` and `/v1/embeddings` default to `embed`;
+any call can name its lane with `X-Lane`.
+
+`X-Wait: <seconds>`: instead of a 202 + job id, the caller holds its connection until its turn
+and then gets the normal (streamed) response, or 429 `{"code": "busy"}` if the wait runs out.
+This is how LangChain's ChatOllama streams through the gateway. Each waiting caller holds a
+gunicorn thread, hence `GUNICORN_THREADS=64`. Finished jobs are forgotten after `JOB_TTL_SECONDS`.
+
+`POST /rerank {"query", "documents": [str], "top_n"?}` -> `{"results": [{"index", "relevance_score"}]}`:
+gte-reranker-modernbert-base, int8 ONNX on CPU (`rerank.py`, no torch). The Docker image bakes
+the model in; on a PC run `python fetch_reranker.py` once. Without the files `/rerank` is 404
+and Studio falls back to fusion scores.

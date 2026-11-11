@@ -1,9 +1,12 @@
 """Studio gateway: one Flask service for every model Studio calls.
 
-LLM (Ollama): /format, /chat, and a pass-through of /v1/* and /api/* for RAG.
-Three lanes run at once (voice, chat, rag). Format, chat, and transcribe answer
+LLM (Ollama): /format, /chat, /rerank, and a pass-through of /v1/* and /api/* for RAG.
+Five lanes run at once: voice, chat and rag answer people; embed carries embeddings
+and reranking so they never wait behind a long answer; ingest carries bulk document
+work and steps aside while anyone is waiting. Format, chat, and transcribe answer
 immediately with a job id and finish in the background, so a slow model does not
-hold the HTTP connection open. A second request on a busy lane waits behind the first.
+hold the HTTP connection open. A second request on a busy lane waits behind the first;
+a caller that sends X-Wait holds its connection instead and still gets its stream.
 
 Speech (Tara, faster-whisper on CUDA): /transcribe, one at a time, queued the same way.
 
@@ -20,25 +23,40 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import threading
 
 import httpx
 from flask import Flask, Response, request, stream_with_context
 
+import rerank
 from keepalive import KeepAlive, ollama_burn
-from lanes import Gate, QueueFull, gate
+from lanes import LANES, USER_LANES, Gate, QueueFull, gate
 from points import shape_points
 from roman import romanize
 
 OLLAMA = os.environ.get("OLLAMA_BASE", "http://127.0.0.1:11434").rstrip("/")
-DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b-instruct-q5_K_M")
+DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:4b-q4_K_M")
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+
+
+def strip_thinking(text: str) -> str:
+    return _THINK_BLOCK.sub("", text).strip()
+
+
+def _chat_path(path: str) -> bool:
+    return path.startswith("/v1/chat") or path.startswith("/api/chat") or path.startswith("/api/generate")
 TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "180"))
 MODEL_DIR = os.environ.get("TARA_DIR", os.path.expanduser("~/models/tara-ct2"))
 
 speech_gate = Gate(("speech",))
 _model = None
 
-_LLM_PATHS = ("/format", "/chat", "/v1/", "/api/")
+_LLM_PATHS = ("/format", "/chat", "/v1/", "/api/", "/rerank")
+# Longest a caller may hold its connection waiting for a lane (X-Wait header).
+MAX_WAIT_SECONDS = 300.0
+# Longest bulk ingest work steps aside for user requests before it runs anyway.
+INGEST_YIELD_SECONDS = float(os.environ.get("INGEST_YIELD_SECONDS", "600"))
 
 
 def llm_enabled() -> bool:
@@ -75,8 +93,23 @@ Rules:
 - Do not translate. English stays English. Hindi stays Hindi.
 - script=roman: write Hindi in Latin letters. "kal milte hain" is right. "कल मिलते हैं" is wrong. "see you tomorrow" is wrong because that is a translation.
 - script=devanagari: write Hindi in Devanagari and English in Latin letters.
+- Mixed Hindi and English stays mixed exactly as spoken. Never translate one part into the other language, and keep every word the speaker meant (a self-correction below is the one exception).
+  "आज लंच पे चलते हैं, I will book the table" becomes "Aaj lunch pe chalte hain, I will book the table."
+  "please call him, वो कब से वेट कर रहा है" becomes "Please call him, woh kab se wait kar raha hai."
+  "मेरा लैपटॉप हैंग हो गया है" becomes "Mera laptop hang ho gaya hai."
 - Drop fillers only when they add nothing. Keep "matlab" and "toh" when they change the meaning.
-- Apply self-corrections. "5 pm, actually 6" becomes "6 pm".
+- Self-corrections override everything else: when the speaker changes their mind, keep only their final choice. Delete the earlier version and the correction words. Check for this before you answer. Correction words include: actually, I mean, sorry, no, wait no, scratch that, make that, or let it be, let it be, nahi, nahi nahi, rehne do, ek minute, matlab nahi.
+  "call at 5 pm, actually 6" becomes "Call at 6 pm."
+  "let's connect at 6 or 7, or let it be, let's connect at 8" becomes "Let's connect at 8."
+  "send it to Rahul, I mean send it to Priya" becomes "Send it to Priya."
+  "buy two tickets, make that four" becomes "Buy four tickets."
+  "kal 4 baje, nahi nahi 5 baje" becomes "kal 5 baje"
+  "mujhe chai chahiye, rehne do, coffee chahiye" becomes "mujhe coffee chahiye"
+  "main Pune ja raha hoon, ek minute, main Mumbai ja raha hoon" becomes "main Mumbai ja raha hoon"
+- It is only a correction when a later part replaces an earlier one. Keep everything when the speaker offers choices or uses these words normally:
+  "we can meet on Friday or Saturday, whichever suits you" keeps both days, because both are still on offer.
+  "I mean it, this is important" becomes "I mean it, this is important." Here "I mean it" is emphasis, not a filler and not a correction, so never drop it.
+  "wait for me at the gate" and "sorry for the delay" stay as they are.
 - When they number points ("point 1", "point 2", "pehla", "doosra"), output a numbered list and nothing else.
 - Do not add facts, greetings, labels, or quotes around the result.
 - Never write the words script= or tone=.
@@ -120,12 +153,38 @@ def _json_error(message: str, status: int):
 
 def lane_for(path: str) -> str:
     header = (request.headers.get("X-Lane") or "").strip().lower()
-    if header in ("voice", "chat", "rag"):
+    if header in LANES:
         return header
     trimmed = path.rstrip("/")
     if trimmed.endswith(("/embeddings", "/embed")):
-        return "rag"
+        return "embed"
     return "chat"
+
+
+def wait_seconds() -> float:
+    """X-Wait: hold this connection up to N seconds for a lane instead of a 202."""
+    raw = (request.headers.get("X-Wait") or "").strip()
+    try:
+        return min(MAX_WAIT_SECONDS, max(0.0, float(raw))) if raw else 0.0
+    except ValueError:
+        return 0.0
+
+
+def yield_to_users() -> None:
+    """Bulk ingest work starts only when no person is waiting on an answer."""
+    waited = 0.0
+    while gate.busy(USER_LANES) and waited < INGEST_YIELD_SECONDS:
+        threading.Event().wait(0.5)
+        waited += 0.5
+
+
+def busy_body(lane: str, waited: bool) -> tuple[dict, int]:
+    detail = (
+        f"The {lane} line stayed busy. Try again in a minute."
+        if waited
+        else f"The {lane} line is full. Your request was not queued."
+    )
+    return {"detail": detail, "code": "busy", "lane": lane, "lanes": gate.snapshot()}, 429
 
 
 def queued_body(job, owner: Gate | None = None) -> dict:
@@ -179,11 +238,7 @@ def dispatch(lane: str, fn):
     try:
         job = gate.admit(lane, fn)
     except QueueFull as exc:
-        return {
-            "detail": f"The {exc.lane} line is full. Your request was not queued.",
-            "lane": exc.lane,
-            "lanes": gate.snapshot(),
-        }, 429
+        return busy_body(exc.lane, waited=False)
     return _answer(job)
 
 
@@ -264,6 +319,10 @@ def health():
     else:
         body["speech"] = "off"
     body["keepalive"] = keeper.snapshot() if keeper is not None else "off"
+    if not rerank.wanted():
+        body["rerank"] = "off"
+    else:
+        body["rerank"] = "ok" if rerank.files_present() else "off: run fetch_reranker.py"
     return body, status
 
 
@@ -289,9 +348,12 @@ def proxy(path: str):
     if request.method == "GET":
         return forward_now(request.path)
     body = request.get_json(silent=True)
-    if isinstance(body, dict) and request.path.startswith("/v1") and "model" not in body:
+    if isinstance(body, dict) and (request.path.startswith("/v1") or _chat_path(request.path)):
         body = dict(body)
-        body["model"] = DEFAULT_MODEL
+        if request.path.startswith("/v1") and "model" not in body:
+            body["model"] = DEFAULT_MODEL
+        if _chat_path(request.path):
+            body["think"] = False
     url = request.path
     if request.query_string:
         url = f"{url}?{request.query_string.decode()}"
@@ -301,26 +363,61 @@ def proxy(path: str):
         work["stream"] = False
 
     method = request.method
+    lane = lane_for(request.path)
 
     def run():
+        if lane == "ingest":
+            yield_to_users()
         return call_upstream(method, url, work if isinstance(work, dict) else None)
 
+    hold = wait_seconds()
     try:
-        job = gate.admit(lane_for(request.path), run)
+        job = gate.admit(lane, run, wait=hold > 0)
     except QueueFull as exc:
-        return {
-            "detail": f"The {exc.lane} line is full. Your request was not queued.",
-            "lane": exc.lane,
-            "lanes": gate.snapshot(),
-        }, 429
+        return busy_body(exc.lane, waited=False)
     if job.status == "queued":
-        return queued_body(job), 202
+        if not hold:
+            return queued_body(job), 202
+        if not gate.wait_turn(job, hold):
+            return busy_body(lane, waited=True)
     if stream:
+        if lane == "ingest":
+            yield_to_users()
         return stream_now(request.method, url, body, job)
     try:
         return gate.run_inline(job)
     except RuntimeError as exc:
         return _json_error(str(exc), 503)
+
+
+@app.post("/rerank")
+def rerank_route():
+    """Score passages against a query with the cross-encoder. Body:
+    {"query": str, "documents": [str], "top_n": int?} -> {"results": [{"index", "relevance_score"}]}
+    """
+    if not rerank.enabled():
+        return _json_error("This gateway has no reranker.", 404)
+    body = request.get_json(silent=True) or {}
+    query = str(body.get("query") or "").strip()
+    documents = body.get("documents")
+    if not query or not isinstance(documents, list) or not documents:
+        return _json_error("query and documents are required", 400)
+    if len(documents) > 64:
+        return _json_error("At most 64 documents per call", 400)
+    docs = [str(item)[:6000] for item in documents]
+    top_n = body.get("top_n")
+    top_n = int(top_n) if isinstance(top_n, int) and top_n > 0 else None
+    try:
+        job = gate.admit("embed", lambda: rerank.rerank(query[:2000], docs, top_n), wait=True)
+    except QueueFull as exc:
+        return busy_body(exc.lane, waited=False)
+    if not gate.wait_turn(job, wait_seconds() or 60):
+        return busy_body("embed", waited=True)
+    try:
+        return {"results": gate.run_inline(job)}
+    except Exception as exc:  # noqa: BLE001
+        log.exception("rerank failed")
+        return _json_error(f"Reranking failed: {exc}", 503)
 
 
 def forward_now(url: str):
@@ -361,17 +458,24 @@ def format_text():
         return _json_error("Text is required", 400)
     script = "devanagari" if str(body.get("script") or "").lower() == "devanagari" else "roman"
     model = str(body.get("model") or DEFAULT_MODEL)
-    source = romanize(text) if script == "roman" else text
+    # The model gets the transcript as spoken (Devanagari included) and writes the Hinglish
+    # itself; that spells words properly (office, tabiyat, karenge). romanize() only runs
+    # afterwards as a safety net so no Devanagari can reach a script=roman result.
+    source = text
     script_rule = (
         "Write Hindi in Devanagari and English in Latin letters."
         if script == "devanagari"
-        else "Write Hindi in Latin letters."
+        else "Write Hindi words in Latin letters the way people type Hinglish (kal, nahi, karenge, tabiyat). English words that arrive in Devanagari get their normal English spelling (मीटिंग is meeting, ऑफिस is office)."
     )
     payload = {
         "model": model,
         "temperature": 0.2,
         "max_tokens": 800,
         "stream": False,
+        # Thinking models (qwen3.x) otherwise spend the whole token budget reasoning and
+        # return empty content. Ollama's /v1 endpoint ignores "think" and honours this.
+        "think": False,
+        "reasoning_effort": "none",
         "messages": [
             {"role": "system", "content": FORMAT_SYSTEM + "\n- " + script_rule},
             {"role": "user", "content": source},
@@ -387,7 +491,7 @@ def format_text():
         lines = content.splitlines()
         while lines and lines[0].strip().lower().startswith(("script=", "tone=")):
             lines.pop(0)
-        content = "\n".join(lines).strip()
+        content = strip_thinking("\n".join(lines).strip())
         if script == "roman":
             content = romanize(content)
         content = shape_points(content)
@@ -407,13 +511,17 @@ def chat_text():
         "model": model,
         "temperature": 0.7,
         "stream": False,
+        # Thinking models (qwen3.x) otherwise spend the whole token budget reasoning and
+        # return empty content. Ollama's /v1 endpoint ignores "think" and honours this.
+        "think": False,
+        "reasoning_effort": "none",
         "messages": [{"role": "user", "content": text}],
     }
 
     def run():
         raw = call_upstream("POST", "/v1/chat/completions", payload)
         try:
-            content = raw["choices"][0]["message"]["content"].strip()
+            content = strip_thinking(raw["choices"][0]["message"]["content"].strip())
         except (KeyError, IndexError, TypeError):
             raise RuntimeError("Ollama returned an unexpected body") from None
         return {"text": content, "model": model}

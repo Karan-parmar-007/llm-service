@@ -16,4 +16,4 @@ $env:TARA_DIR = ($env:TARA_DIR -replace '^~', $HOME)
 $bind = if ($env:BIND) { $env:BIND } else { "0.0.0.0:8003" }
 $hostPart, $portPart = $bind -split ':', 2
 # gunicorn does not run on Windows; waitress does the same job here.
-.\venv\Scripts\python -m waitress --host $hostPart --port $portPart --threads 8 app:app
+.\venv\Scripts\python -m waitress --host $hostPart --port $portPart --threads 64 app:app

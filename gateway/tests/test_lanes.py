@@ -28,7 +28,7 @@ def test_one_slot_per_lane_and_three_lanes_at_once():
     assert all(started[name].wait(1) for name in started)
     board = gate.snapshot()
     assert board["running"] == 3
-    assert board["parallel_max"] == 3
+    assert board["parallel_max"] == 5
 
     queued = gate.admit("voice", lambda: "later")
     assert queued.status == "queued"
