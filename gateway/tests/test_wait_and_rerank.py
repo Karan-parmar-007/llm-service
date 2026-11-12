@@ -103,3 +103,37 @@ def test_proxy_with_wait_header_returns_429_when_the_line_never_frees(client, mo
     )
     assert response.status_code == 429
     assert response.get_json()["code"] == "busy"
+
+
+def test_a_stream_that_times_out_ends_with_an_error_line(client, monkeypatch):
+    import json as _json
+
+    class SlowUpstream:
+        status_code = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def iter_bytes(self):
+            yield b'{"message":{"content":"Hi"}}\n'
+            raise gateway.httpx.ReadTimeout("timed out")
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        def stream(self, *args, **kwargs):
+            return SlowUpstream()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(gateway.httpx, "Client", FakeClient)
+    response = client.post("/api/chat", json={"model": "m", "messages": [], "stream": True})
+    lines = [_json.loads(line) for line in response.get_data(as_text=True).splitlines() if line.strip()]
+    assert lines[0]["message"]["content"] == "Hi"
+    assert "did not answer in time" in lines[-1]["error"]
+    assert gateway.gate.snapshot()["lanes"]["chat"]["running"] is False  # lane freed

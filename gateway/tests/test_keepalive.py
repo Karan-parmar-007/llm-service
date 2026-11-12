@@ -27,8 +27,16 @@ class FakeBurn:
         return 1
 
 
-def _keeper(burn, busy=lambda: False, busy_s=5, idle_s=0.05, quiet_s=0.05):
-    return KeepAlive(busy, burn, busy_seconds=busy_s, idle_seconds=idle_s, quiet_seconds=quiet_s, poll_seconds=0.02)
+def _keeper(burn, busy=lambda: False, busy_s=5, idle_s=0.05, quiet_s=0.05, embed_quiet_s=0.0):
+    return KeepAlive(
+        busy,
+        burn,
+        busy_seconds=busy_s,
+        idle_seconds=idle_s,
+        quiet_seconds=quiet_s,
+        embed_quiet_seconds=embed_quiet_s,
+        poll_seconds=0.02,
+    )
 
 
 def test_runs_when_nobody_is_using_the_llm():
@@ -74,6 +82,48 @@ def test_waits_while_user_work_is_running_or_queued():
         assert burn.started.wait(1)
     finally:
         keeper.stop()
+
+
+def test_embedding_holds_keepalive_off_after_the_request_finishes():
+    burn = FakeBurn()
+    keeper = _keeper(burn, busy_s=30, quiet_s=0.05, embed_quiet_s=0.35)
+    keeper.start()
+    try:
+        assert burn.started.wait(1)
+        keeper.embedding_activity()
+        assert burn.stopped_early.wait(1)
+        time.sleep(0.12)  # user quiet has passed; embedding hold has not
+        assert keeper.state in ("paused", "resting")
+        assert burn.calls == 1
+        assert keeper.snapshot()["paused_for_embedding"] is True
+        deadline = time.monotonic() + 1
+        while burn.calls < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert burn.calls >= 2
+    finally:
+        keeper.stop()
+
+
+def test_embed_and_ingest_hold_keepalive_chat_does_not(monkeypatch):
+    seen = []
+
+    class Spy:
+        def user_activity(self):
+            seen.append("user")
+
+        def embedding_activity(self):
+            seen.append("embed")
+
+        def snapshot(self):
+            return {"state": "spy"}
+
+    monkeypatch.setattr(gateway, "keeper", Spy())
+    monkeypatch.setattr(gateway, "call_upstream", lambda *args, **kwargs: {})
+    client = gateway.app.test_client()
+    client.post("/api/embed", json={"input": "x"})
+    client.post("/api/chat", json={}, headers={"X-Lane": "ingest"})
+    client.post("/format", json={})
+    assert seen == ["embed", "embed", "user"]
 
 
 def test_ollama_errors_do_not_kill_the_loop():
