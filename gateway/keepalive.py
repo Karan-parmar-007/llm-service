@@ -5,7 +5,9 @@ generation for `busy_seconds`, rests for `idle_seconds`, and repeats, but only
 while no user request is running or queued and none arrived in the last
 `quiet_seconds`. When a user request arrives, the running generation is cancelled
 by closing its HTTP stream (Ollama stops at the next token), so users never wait
-behind it.
+behind it. Embedding and bulk ingest hold it off for `embed_quiet_seconds` as
+well: the chat model and the embedding model together fill the memory cap, so
+the keep-alive must not be generating while vectors are being built.
 
 Switched on with KEEPALIVE_ENABLED=1 (LLM VPS only). Tuned with
 KEEPALIVE_BUSY_SECONDS, KEEPALIVE_IDLE_SECONDS, KEEPALIVE_QUIET_SECONDS.
@@ -67,6 +69,7 @@ class KeepAlive:
         busy_seconds: float = 20,
         idle_seconds: float = 40,
         quiet_seconds: float = 30,
+        embed_quiet_seconds: float = 180,
         poll_seconds: float = 1,
     ) -> None:
         self._is_busy = is_busy
@@ -74,10 +77,12 @@ class KeepAlive:
         self.busy_seconds = busy_seconds
         self.idle_seconds = idle_seconds
         self.quiet_seconds = quiet_seconds
+        self.embed_quiet_seconds = embed_quiet_seconds
         self._poll = poll_seconds
         self._user = threading.Event()
         self._stop = threading.Event()
         self._last_user = 0.0
+        self._last_embed = 0.0
         self._thread: threading.Thread | None = None
         self.state = "starting"
         self.runs = 0
@@ -100,9 +105,23 @@ class KeepAlive:
         self._last_user = time.monotonic()
         self._user.set()
 
+    def embedding_activity(self) -> None:
+        """Call on embed and ingest requests. Cancels the chat-model burn and
+        keeps it off until embedding has been quiet, so the two models are not
+        working at the same time."""
+        self._last_embed = time.monotonic()
+        self.user_activity()
+
     # ------------------------------------------------------------ loop
+    def _embedding(self) -> bool:
+        return time.monotonic() - self._last_embed < self.embed_quiet_seconds
+
     def _quiet(self) -> bool:
-        return not self._is_busy() and time.monotonic() - self._last_user >= self.quiet_seconds
+        return (
+            not self._embedding()
+            and not self._is_busy()
+            and time.monotonic() - self._last_user >= self.quiet_seconds
+        )
 
     def _should_stop(self) -> bool:
         return self._user.is_set() or self._stop.is_set() or self._is_busy()
@@ -136,4 +155,5 @@ class KeepAlive:
             "busy_seconds": self.busy_seconds,
             "idle_seconds": self.idle_seconds,
             "quiet_seconds": self.quiet_seconds,
+            "paused_for_embedding": self._embedding(),
         }

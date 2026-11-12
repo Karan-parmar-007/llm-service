@@ -47,6 +47,10 @@ def strip_thinking(text: str) -> str:
 def _chat_path(path: str) -> bool:
     return path.startswith("/v1/chat") or path.startswith("/api/chat") or path.startswith("/api/generate")
 TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "180"))
+# Streamed answers: longest silence allowed between two pieces of output. On a 2-core CPU the
+# model can need minutes to read a long prompt before its first word, so this is far longer
+# than TIMEOUT. The caller sees progress the whole time ("In line", "Thinking... 90s").
+STREAM_TIMEOUT = float(os.environ.get("OLLAMA_STREAM_TIMEOUT_SECONDS", "900"))
 MODEL_DIR = os.environ.get("TARA_DIR", os.path.expanduser("~/models/tara-ct2"))
 
 speech_gate = Gate(("speech",))
@@ -137,7 +141,12 @@ def only_enabled_parts():
     if path.startswith(_LLM_PATHS) and not llm_enabled():
         return {"detail": "This gateway does not serve the LLM."}, 404
     if keeper is not None and request.method != "GET" and path.startswith(_LLM_PATHS):
-        keeper.user_activity()  # user first: cancel any keep-alive generation now
+        # Embeddings load the second model. Cancel the keep-alive chat generation
+        # and hold it off, or the two together cross the memory cap.
+        if lane_for(path) in ("embed", "ingest"):
+            keeper.embedding_activity()
+        else:
+            keeper.user_activity()
     if path == "/transcribe" and not speech_enabled():
         return {"detail": "This gateway does not serve speech."}, 404
     return None
@@ -290,6 +299,7 @@ if llm_enabled() and os.environ.get("KEEPALIVE_ENABLED", "0").strip() == "1":
         busy_seconds=_env_seconds("KEEPALIVE_BUSY_SECONDS", 20),
         idle_seconds=_env_seconds("KEEPALIVE_IDLE_SECONDS", 40),
         quiet_seconds=_env_seconds("KEEPALIVE_QUIET_SECONDS", 30),
+        embed_quiet_seconds=_env_seconds("KEEPALIVE_EMBED_QUIET_SECONDS", 180),
     )
     keeper.start()
 
@@ -435,7 +445,7 @@ def forward_now(url: str):
 
 def stream_now(method: str, url: str, body, job):
     def generate():
-        client = _client()
+        client = httpx.Client(base_url=OLLAMA, timeout=httpx.Timeout(STREAM_TIMEOUT, connect=10.0))
         try:
             with client.stream(method, url, json=body) as upstream:
                 if upstream.status_code >= 400:
@@ -443,6 +453,12 @@ def stream_now(method: str, url: str, body, job):
                     return
                 for chunk in upstream.iter_bytes():
                     yield chunk
+        except httpx.HTTPError as exc:
+            # The response has already started, so no status code can change now. Send an
+            # Ollama-style error line instead of letting gunicorn emit an HTML 500 page: the
+            # caller's Ollama client raises it as a readable error.
+            log.warning("stream from Ollama failed: %r", exc)
+            yield (json.dumps({"error": f"The model did not answer in time ({type(exc).__name__})."}) + "\n").encode()
         finally:
             client.close()
             gate.finish(job)
